@@ -15,6 +15,7 @@ import numpy
 
 import theano
 import theano.tensor as T
+from theano.tensor.nnet import conv
 import os
 
 from theano.tensor.shared_randomstreams import RandomStreams
@@ -263,6 +264,7 @@ class RBM(object):
 
         cost = T.mean(self.free_energy(self.input)) - T.mean(
             self.free_energy(chain_end))
+
         # We must not compute the gradient through the gibbs sampling
         gparams = T.grad(cost, self.params, consider_constant=[chain_end])
         # end-snippet-3 start-snippet-4
@@ -273,6 +275,7 @@ class RBM(object):
                 lr,
                 dtype=theano.config.floatX
             )
+
         if persistent:
             # Note that this works only if persistent is a shared variable
             updates[persistent] = nh_samples[-1]
@@ -282,7 +285,6 @@ class RBM(object):
             # reconstruction cross-entropy is a better proxy for CD
             monitoring_cost = self.get_reconstruction_cost(updates,
                                                            pre_sigmoid_nvs[-1])
-
         return monitoring_cost, updates
         # end-snippet-4
 
@@ -354,6 +356,223 @@ class RBM(object):
         )
 
         return cross_entropy
+
+
+class ConvolutionalRBM(RBM):
+
+    def __init__(self, image_shape, filter_shape,
+                       input_layers, hidden_layers,
+                       batch_size,
+                       numpy_rng=None, theano_rng=None):
+        if numpy_rng is None:
+            numpy_rng = numpy.random.RandomState(1234)
+        self.numpy_rng = numpy_rng
+        if theano_rng is None:
+            theano_rng = RandomStreams(numpy_rng.randint(2**30))
+        self.theano_rng = theano_rng
+        param_size = filter_shape[0]*filter_shape[1]
+        initial_W = lambda: numpy.asarray(
+            numpy_rng.uniform(
+                low=-1 * numpy.sqrt(1. / param_size),
+                high=1 * numpy.sqrt(1. / param_size),
+                size=(hidden_layers, input_layers, filter_shape[0], filter_shape[1])
+            ),
+            dtype=theano.config.floatX
+        )
+        # theano shared variables for weights and biases
+        self.W = theano.shared(value=initial_W(), name='W', borrow=True)
+        self.gW = theano.shared(value=initial_W(), name='gW', borrow=True)
+
+        initial_hbias = lambda: numpy.zeros(
+                                    hidden_layers,
+                                    dtype=theano.config.floatX
+                                )
+        self.hbias = theano.shared(value=initial_hbias(), name='hbias', borrow=True)
+        self.ghbias = theano.shared(value=initial_hbias(), name='ghbias', borrow=True)
+
+        initial_vbias = lambda: numpy.zeros(
+                                    input_layers,
+                                    dtype=theano.config.floatX
+                                )
+        self.vbias = theano.shared(value=initial_vbias(), name='vbias', borrow=True)
+        self.gvbias = theano.shared(value=initial_vbias(), name='gvbias', borrow=True)
+
+        self.params = [self.W, self.vbias, self.hbias]
+        self.batch_size = batch_size
+        self.image_shape, self.filter_shape = image_shape, filter_shape
+        self.input_layers, self.hidden_layers = input_layers, hidden_layers
+        self.n_visible = image_shape[0]*image_shape[1]
+        self.input = T.tensor4()
+
+    def free_energy(self, v_sample):
+        wx_b, _ = self.propup(v_sample)
+        vbias_term = T.sum(v_sample*self.vbias.dimshuffle('x', 0, 'x', 'x'), axis=(1, 2, 3))
+        hidden_term = T.sum(T.log(1 + T.exp(wx_b)), axis=(1, 2, 3))
+        return -hidden_term - vbias_term
+
+    def propup(self, vis):
+        conv_out = conv.conv2d(
+            input=vis,
+            filters=self.W,
+            filter_shape=(
+                self.hidden_layers, self.input_layers,
+                self.filter_shape[0], self.filter_shape[1]
+            ),
+            image_shape=(
+                self.batch_size, self.input_layers,
+                self.image_shape[0], self.image_shape[1]
+            )
+        )
+        wx_b = conv_out + self.hbias.dimshuffle('x', 0, 'x', 'x')
+        return [wx_b, T.nnet.sigmoid(wx_b)]
+
+    def propdown(self, hid):
+        W_T = self.W.transpose((1, 0, 2, 3))
+        flipped_W_T = W_T[:, :, ::-1, ::-1]
+        conv_out = conv.conv2d(
+            input=hid,
+            filters=flipped_W_T,
+            filter_shape=(
+                self.input_layers, self.hidden_layers,
+                self.filter_shape[0], self.filter_shape[1]
+            ),
+            image_shape=(
+                self.batch_size, self.hidden_layers,
+                self.image_shape[0] - self.filter_shape[0] + 1,
+                self.image_shape[1] - self.filter_shape[1] + 1
+            ),
+            border_mode='full'
+        )
+        wh_a = conv_out + self.vbias.dimshuffle('x', 0, 'x', 'x')
+        return [wh_a, T.nnet.sigmoid(wh_a)]
+
+    def get_cost_updates(self, lr=0.1, persistent=None, k=15,
+                         sparsity_reg=.1, sparsity=.1, momentum=.9):
+        """This functions implements one step of CD-k or PCD-k
+
+        :param lr: learning rate used to train the RBM
+
+        :param persistent: None for CD. For PCD, shared variable
+            containing old state of Gibbs chain. This must be a shared
+            variable of size (batch size, number of hidden units).
+
+        :param k: number of Gibbs steps to do in CD-k/PCD-k
+
+        Returns a proxy for the cost and the updates dictionary. The
+        dictionary contains the update rules for weights and biases but
+        also an update of the shared variable used to store the persistent
+        chain, if one is used.
+
+        """
+
+        # compute positive phase
+        pre_sigmoid_ph, ph_mean, ph_sample = self.sample_h_given_v(self.input)
+
+        # decide how to initialize persistent chain:
+        # for CD, we use the newly generate hidden sample
+        # for PCD, we initialize from the old state of the chain
+        if persistent is None:
+            chain_start = ph_sample
+        else:
+            chain_start = persistent
+        # end-snippet-2
+        # perform actual negative phase
+        # in order to implement CD-k/PCD-k we need to scan over the
+        # function that implements one gibbs step k times.
+        # Read Theano tutorial on scan for more information :
+        # http://deeplearning.net/software/theano/library/scan.html
+        # the scan will return the entire Gibbs chain
+        (
+            [
+                pre_sigmoid_nvs,
+                nv_means,
+                nv_samples,
+                pre_sigmoid_nhs,
+                nh_means,
+                nh_samples
+            ],
+            updates
+        ) = theano.scan(
+            self.gibbs_hvh,
+            # the None are place holders, saying that
+            # chain_start is the initial state corresponding to the
+            # 6th output
+            outputs_info=[None, None, None, None, None, chain_start],
+            n_steps=k
+        )
+        # start-snippet-3
+        # determine gradients on RBM parameters
+        # note that we only need the sample at the end of the chain
+
+        v0h0 = conv.conv2d(input=self.input.transpose((1, 0, 2, 3)),
+                         filters=ph_sample.transpose((1, 0, 2, 3)),
+                         image_shape=(self.input_layers, self.batch_size,
+                                      self.image_shape[0], self.image_shape[1]),
+                         filter_shape=(self.hidden_layers, self.batch_size,
+                                       self.image_shape[0] - self.filter_shape[0] + 1,
+                                       self.image_shape[1] - self.filter_shape[1] + 1)
+            ).transpose((1, 0, 2, 3))
+
+        v1h1 = conv.conv2d(input=nv_samples[-1].transpose((1, 0, 2, 3)),
+                         filters=nh_samples[-1].transpose((1, 0, 2, 3)),
+                         image_shape=(self.input_layers, self.batch_size,
+                                      self.image_shape[0], self.image_shape[1]),
+                         filter_shape=(self.hidden_layers, self.batch_size,
+                                       self.image_shape[0] - self.filter_shape[0] + 1,
+                                       self.image_shape[1] - self.filter_shape[1] + 1)
+            ).transpose((1, 0, 2, 3))
+        lr = T.cast(lr, dtype=theano.config.floatX)
+        gW = momentum*self.gW + (1 - momentum)*lr*(v0h0 - v1h1)/self.batch_size
+        updates[self.gW] = gW
+        updates[self.W] = self.W + gW
+
+        gvbias = momentum*self.gvbias + (1 - momentum)*lr*(self.input - nv_samples[-1]).mean(axis=(0, 2, 3))
+        updates[self.gvbias] = gvbias
+        updates[self.vbias] = self.vbias + gvbias
+
+        ghbias = momentum*self.ghbias +\
+            (1 - momentum)*(lr*(nh_samples[0] - nh_samples[-1]).mean(axis=(0, 2, 3)))
+        if sparsity is not None:
+            ghbias += sparsity_reg*(sparsity - ph_sample.mean(axis=(0, 2, 3)))
+
+        updates[self.ghbias] = ghbias
+        updates[self.hbias] = self.hbias + ghbias
+
+        if persistent:
+            updates[persistent] = nh_samples[-1]
+
+        return (self.input - nv_samples[-1]).mean(), updates
+
+    def get_reconstruction_cost(self, updates, pre_sigmoid_nv):
+        cross_entropy = T.mean(
+            T.sum(
+                self.input * T.log(T.nnet.sigmoid(pre_sigmoid_nv)) +
+                (1 - self.input) * T.log(1 - T.nnet.sigmoid(pre_sigmoid_nv)),
+                axis=(2, 3)
+            ),
+            axis=(0, 1)
+        )
+
+        return cross_entropy
+
+    def adaptive_gradient(self, grad, prev_grad=None, alpha=0.2, momentum=0.2, l2_reg=0):
+        '''Apply a gradient to the named parameter array.
+        Returns the applied gradient.
+        name: The name (a string) of a parameter to adjust.
+        grad: Gradient for the named parameters.
+        prev_grad: If given, this should be a previous gradient to use for
+          momentum calculations.
+        alpha: Learning rate.
+        momentum: A parameter in (0, 1) that determines the weight momentum.
+        l2_reg: A parameter (usually << 1) that controls the amount of L2 weight
+          regularization.
+        '''
+        if 1 > momentum > 0 and prev_grad is not None:
+            l2_reg = T.cast(l2_reg, dtype=theano.config.floatX)
+            alpha = T.cast(alpha, dtype=theano.config.floatX)
+            momentum = T.cast(momentum, dtype=theano.config.floatX)
+            grad = momentum * prev_grad + (1 - momentum) * alpha * (grad - l2_reg * grad)
+        return grad
 
 
 def test_rbm(learning_rate=0.1, training_epochs=15,
