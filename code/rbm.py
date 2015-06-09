@@ -523,6 +523,17 @@ class ConvolutionalRBM(RBM):
             ).transpose((1, 0, 2, 3))
         lr = T.cast(lr, dtype=theano.config.floatX)
         gW = momentum*self.gW + (1 - momentum)*lr*(v0h0 - v1h1)/self.batch_size
+        if sparsity is not None:
+            dSparsity = conv.conv2d(
+                    input=self.input.transpose((1, 0, 2, 3)),
+                    filters=(sparsity - ph_sample).transpose((1, 0, 2, 3)),
+                    image_shape=(self.input_layers, self.batch_size,
+                                self.image_shape[0], self.image_shape[1]),
+                    filter_shape=(self.hidden_layers, self.batch_size,
+                                self.image_shape[0] - self.filter_shape[0] + 1,
+                                self.image_shape[1] - self.filter_shape[1] + 1)
+                ).transpose((1, 0, 2, 3))
+            gW += sparsity_reg*dSparsity
         updates[self.gW] = gW
         updates[self.W] = self.W + gW
 
@@ -534,6 +545,7 @@ class ConvolutionalRBM(RBM):
             (1 - momentum)*(lr*(nh_samples[0] - nh_samples[-1]).mean(axis=(0, 2, 3)))
         if sparsity is not None:
             ghbias += sparsity_reg*(sparsity - ph_sample.mean(axis=(0, 2, 3)))
+
 
         updates[self.ghbias] = ghbias
         updates[self.hbias] = self.hbias + ghbias
